@@ -1,0 +1,121 @@
+name: Construir CSVs para Overleaf
+on:
+  push:
+    paths:
+      - "data/raw/Netlab_2025_dengue.xlsx"
+  schedule:
+    - cron: "0 12 * * 1"   # Lunes 12:00 UTC (07:00 Lima)
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install pandas openpyxl
+
+      - name: Generar CSVs procesados
+        run: |
+          python - <<'PY'
+          import pandas as pd, numpy as np, os, re
+
+          src = "data/raw/Netlab_2025_dengue.xlsx"
+          sheet = "NET LAB 2025"  # Cambia aquí si tu hoja tiene otro nombre
+
+          # Lee Excel
+          df = pd.read_excel(src, sheet_name=sheet)
+
+          # Renombrar columnas si existen
+          rename = {
+              "Fecha Colección": "fecha_col",
+              "Fecha Recepción ROM": "fecha_rom",
+              "Fecha Verificación": "fecha_ver",
+              "Nombre de Examen": "examen",
+              "Resultado": "resultado",
+              "SE ": "se",   # en tu base la col se llama 'SE ' (con espacio)
+              "SE": "se"
+          }
+          for k,v in list(rename.items()):
+              if k not in df.columns: rename.pop(k, None)
+          df = df.rename(columns=rename)
+
+          # Convertir a fechas
+          for c in ["fecha_col","fecha_rom","fecha_ver"]:
+              if c in df.columns:
+                  df[c] = pd.to_datetime(df[c], errors="coerce")
+
+          # Normalizar resultado
+          def norm_res(x):
+              if not isinstance(x, str): return np.nan
+              s = x.strip().upper()
+              s = re.sub(r"\s*-\s*$", "", s)  # limpia guion final
+              mapa = {"POSITIVO":"Positivo","NEGATIVO":"Negativo","INDETERMINADO":"Indeterminado"}
+              return mapa.get(s, s.title())
+          if "resultado" in df.columns:
+              df["resultado_n"] = df["resultado"].map(norm_res)
+
+          # Semana epi: usar 'se' si está; si no, calcular desde alguna fecha
+          if "se" in df.columns and df["se"].notna().any():
+              df["semana"] = df["se"].astype(str).str.strip()
+          else:
+              base = df.get("fecha_ver")
+              if base is None: base = df.get("fecha_rom")
+              if base is None: base = df.get("fecha_col")
+              base = pd.to_datetime(base, errors="coerce")
+              iso = base.dt.isocalendar()
+              df["semana"] = iso["year"].astype("Int64").astype(str) + "-W" + iso["week"].astype("Int64").astype(str).str.zfill(2)
+
+          # Asegurar carpeta de salida
+          os.makedirs("data/processed", exist_ok=True)
+
+          # A) Casos por semana
+          casos = df.groupby("semana", dropna=False).size().reset_index(name="casos").sort_values("semana")
+          casos.to_csv("data/processed/casos_por_semana.csv", index=False)
+
+          # B) Positividad por semana (Pos/Neg)
+          if "resultado_n" in df.columns:
+              tmp = df[df["resultado_n"].isin(["Positivo","Negativo"])].copy()
+              if not tmp.empty:
+                  tmp["pos"] = (tmp["resultado_n"]=="Positivo").astype(int)
+                  pos = tmp.groupby("semana", dropna=False)["pos"].agg(total="size", positivos="sum").reset_index()
+                  pos["negativos"] = pos["total"] - pos["positivos"]
+                  pos["positividad"] = (pos["positivos"]/pos["total"]*100).round(2)
+                  pos = pos.sort_values("semana")
+                  pos.to_csv("data/processed/positividad_por_semana.csv", index=False)
+
+          # C) Oportunidad (días)
+          def dias(a,b):
+              return (b - a).dt.days
+
+          if {"fecha_col","fecha_rom","fecha_ver"} <= set(df.columns):
+              df["d_col_rom"] = dias(df["fecha_col"], df["fecha_rom"])
+              df["d_rom_ver"] = dias(df["fecha_rom"], df["fecha_ver"])
+              df["d_col_ver"] = dias(df["fecha_col"], df["fecha_ver"])
+
+              bins = [-1,0,1,2,3,4,7,10**6]
+              labels = ["0","1","2","3","4","5-7","8+"]
+              for k in ["d_col_rom","d_rom_ver","d_col_ver"]:
+                  s = pd.cut(df[k], bins=bins, labels=labels)
+                  g = s.value_counts(dropna=False).reindex(labels).fillna(0).astype(int)
+                  g = g.rename_axis("dias").reset_index(name="conteo")
+                  total = int(g["conteo"].sum())
+                  g["porcentaje"] = (g["conteo"]/total*100).round(2) if total>0 else 0
+                  # nombres de archivo limpios: op_col_rom, op_rom_ver, op_col_ver
+                  g.to_csv(f"data/processed/op_{k.split('_')[1]}_{k.split('_')[2]}.csv", index=False)
+          PY
+
+      - name: Commit CSVs
+        run: |
+          git config user.name  "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/processed/*.csv
+          git commit -m "Actualiza CSVs procesados" || echo "Sin cambios"
+          git push
